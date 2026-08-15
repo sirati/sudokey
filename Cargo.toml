@@ -1,0 +1,26 @@
+[package]
+name = "sudokey"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal SSH-agent-authenticated root command broker over a unix socket"
+license = "MIT"
+
+[[bin]]
+name = "sudokey"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+getrandom = "0.2"
+base64 = "0.22"
+# High-level, safe wrappers so this crate contains no `unsafe`:
+portable-pty = "0.8"                 # pty alloc + fork/exec, done safely for us
+rustix = { version = "0.38", features = ["termios", "process"] } # termios/winsize/euid
+signal-hook = "0.3"                  # clean SIGINT/SIGTERM socket teardown
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

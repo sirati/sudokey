@@ -1,0 +1,6 @@
+# Build a fully static, non-PIE musl binary (self-contained, no libc runtime
+# dependency). `relocation-model=static` makes `file` report "statically
+# linked" rather than "static-pie linked", which also works on the oldest
+# target (Debian 11 / glibc 2.31) without any dynamic loader.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

@@ -1,0 +1,9 @@
+/target
+result
+result-*
+.direnv
+
+# kache: generated per `nix develop` (see flake), and the store it keeps
+# beside this checkout. Both describe one machine and are never a commit.
+/.kache.toml
+/.kache-store/
