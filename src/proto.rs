@@ -3,7 +3,11 @@
 /// 4-byte magic sent by the server at the start of every connection.
 pub const MAGIC: [u8; 4] = *b"SDKY";
 /// Protocol version byte.
-pub const VERSION: u8 = 1;
+///
+/// v2 replaced the "sign with everything up front" handshake with an
+/// offer-then-sign exchange; see `MAX_KEYS` and `KEY_NONE`. Client and server
+/// must match, and the client says so plainly if they do not.
+pub const VERSION: u8 = 2;
 
 /// Context string mixed into the signed data so signatures produced for
 /// sudokey cannot be confused with signatures for any other purpose.
@@ -11,6 +15,10 @@ pub const CONTEXT: &[u8] = b"sudokey-auth-v1";
 
 /// Length of the per-connection random challenge nonce.
 pub const NONCE_LEN: usize = 32;
+
+/// Reply to the key offer meaning "none of these is authorized". Any other
+/// value is an index into the list the client just offered.
+pub const KEY_NONE: u32 = u32::MAX;
 
 /// Auth result byte sent by the server after the challenge/response.
 pub const STATUS_OK: u8 = 1;
@@ -32,7 +40,7 @@ pub const CH_STDIN_EOF: u8 = 5; // client -> server (stdin closed)
 /// memory. Frame payloads and ssh-wire strings are both capped.
 pub const MAX_FRAME: usize = 1 << 20; // 1 MiB per stream frame
 pub const MAX_STRING: usize = 1 << 18; // 256 KiB per ssh-wire string
-pub const MAX_KEYS: u32 = 64; // auth pairs per connection
+pub const MAX_KEYS: u32 = 64; // key offers per connection
 pub const MAX_ARGV: u32 = 4096; // argv elements
 
 /// Handshake-specific bounds. `MAX_STRING` is far too generous for the

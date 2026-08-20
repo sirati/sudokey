@@ -69,34 +69,61 @@ fn connect_and_auth(socket_path: &OsStr) -> io::Result<UnixStream> {
     signed.extend_from_slice(CONTEXT);
     signed.extend_from_slice(&nonce);
 
-    // 2. Sign with every ed25519 identity the agent holds, up to what the
-    //    server will accept — sending more just gets the connection dropped.
+    // 2. Offer the agent's ed25519 public keys, and sign only the one the
+    //    server picks.
+    //
+    //    Signing with every identity up front (protocol v1) meant one agent
+    //    signature request per key. Against an agent that asks before signing
+    //    -- 1Password, or `ssh-add -c` -- that is a prompt per key, for keys
+    //    that have nothing to do with sudokey, every single invocation.
+    //    Listing and offering never prompt; only signing does. So this asks
+    //    the agent for exactly one signature, and for none at all when the
+    //    server recognises none of our keys.
     let mut agent_conn =
         agent::connect().map_err(|e| io::Error::new(e.kind(), format!("ssh-agent: {e}")))?;
     let ids = agent::list_identities(&mut agent_conn)?;
-    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for id in ids.iter().filter(|i| i.is_ed25519()) {
-        if pairs.len() >= MAX_KEYS as usize {
-            break;
-        }
-        // Agent refused to sign with this key -> skip it.
-        if let Ok(Some(sig)) = agent::sign(&mut agent_conn, &id.key_blob, &signed) {
-            pairs.push((id.key_blob.clone(), sig));
-        }
-    }
-    if pairs.is_empty() {
+    let offers: Vec<Vec<u8>> = ids
+        .iter()
+        .filter(|i| i.is_ed25519())
+        .take(MAX_KEYS as usize)
+        .map(|i| i.key_blob.clone())
+        .collect();
+    if offers.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "the ssh-agent produced no ed25519 signatures \
-             (is an agent forwarded, and does it hold an ed25519 key?)",
+            "the ssh-agent holds no ed25519 identities \
+             (is an agent running, and forwarded if you are over ssh?)",
         ));
     }
 
-    write_u32(&mut stream, pairs.len() as u32)?;
-    for (kb, sig) in &pairs {
-        write_string(&mut stream, kb)?;
-        write_string(&mut stream, sig)?;
+    write_u32(&mut stream, offers.len() as u32)?;
+    for blob in &offers {
+        write_string(&mut stream, blob)?;
     }
+    stream.flush()?;
+
+    let selected = read_u32(&mut stream)?;
+    if selected == KEY_NONE {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "access denied: none of your agent's ed25519 keys is authorized \
+             (is your public key in the server's authorized_keys?)",
+        ));
+    }
+    let Some(key_blob) = offers.get(selected as usize) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server selected a key we did not offer",
+        ));
+    };
+
+    let sig = agent::sign(&mut agent_conn, key_blob, &signed)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the ssh-agent refused to sign with the key the server selected",
+        )
+    })?;
+    write_string(&mut stream, &sig)?;
     stream.flush()?;
 
     // 3. Read status.

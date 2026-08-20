@@ -645,48 +645,65 @@ fn authenticate(
     signed.extend_from_slice(CONTEXT);
     signed.extend_from_slice(&nonce);
 
+    // The client offers public keys first and signs only the one we pick.
+    // Asking it to sign with everything it holds, as v1 did, meant an agent
+    // prompt per key: with nine keys loaded and a confirming agent (1Password,
+    // `ssh-add -c`), one `sudokey run` produced a prompt for each unrelated key
+    // before reaching the right one. Offering costs nothing -- listing
+    // identities never prompts, only signing does.
     let mut r = Deadline {
         stream,
         at: deadline,
     };
-    let npairs = read_u32(&mut r)?;
-    if npairs > MAX_KEYS {
+    let noffers = read_u32(&mut r)?;
+    if noffers > MAX_KEYS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("too many auth pairs: {npairs}"),
+            format!("too many key offers: {noffers}"),
         ));
     }
-
-    let mut granted = None;
-    for _ in 0..npairs {
-        let key_blob = read_string_bounded(&mut r, MAX_BLOB)?;
-        let sig_blob = read_string_bounded(&mut r, MAX_BLOB)?;
-        if granted.is_some() {
-            continue; // already authorized; still drain the rest of the message
-        }
-        let Some(info) = keys.get(&key_blob) else {
-            continue;
-        };
-        let (Some(pk), Some(sig)) = (
-            agent::ed25519_pubkey(&key_blob),
-            agent::ed25519_sig(&sig_blob),
-        ) else {
-            continue;
-        };
-        let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
-            continue;
-        };
-        if vk
-            .verify_strict(&signed, &Signature::from_bytes(&sig))
-            .is_ok()
-        {
-            granted = Some(Granted {
-                fingerprint: info.fingerprint.clone(),
-                comment: info.comment.clone(),
-            });
-        }
+    let mut offers = Vec::with_capacity(noffers.min(MAX_KEYS) as usize);
+    for _ in 0..noffers {
+        offers.push(read_string_bounded(&mut r, MAX_BLOB)?);
     }
-    Ok(granted)
+
+    // Take the first offer we would accept. Telling the client which of its own
+    // keys is authorized is the same disclosure OpenSSH's publickey auth makes,
+    // and a caller must already hold the key to have offered it.
+    let Some(index) = offers.iter().position(|blob| keys.contains_key(blob)) else {
+        write_u32(&mut w, KEY_NONE)?;
+        w.flush()?;
+        return Ok(None);
+    };
+    write_u32(&mut w, index as u32)?;
+    w.flush()?;
+
+    // Now, and only now, one signature over CONTEXT || nonce.
+    let key_blob = &offers[index];
+    let sig_blob = read_string_bounded(&mut r, MAX_BLOB)?;
+    let info = keys
+        .get(key_blob)
+        .expect("the offer was matched against this same map");
+
+    let (Some(pk), Some(sig)) = (
+        agent::ed25519_pubkey(key_blob),
+        agent::ed25519_sig(&sig_blob),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
+        return Ok(None);
+    };
+    if vk
+        .verify_strict(&signed, &Signature::from_bytes(&sig))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Granted {
+        fingerprint: info.fingerprint.clone(),
+        comment: info.comment.clone(),
+    }))
 }
 
 /// Render argv for the audit log without letting a crafted command forge log
@@ -730,20 +747,16 @@ fn handle_conn(
     let granted = authenticate(&stream, deadline, &keys)?;
 
     let mut w = &stream;
-    write_u8(
-        &mut w,
-        if granted.is_some() {
-            STATUS_OK
-        } else {
-            STATUS_DENY
-        },
-    )?;
-    w.flush()?;
-
     let Some(granted) = granted else {
+        // Audit before answering: a client that has already hung up must not
+        // cost us the record that it was refused.
         audit!("DENIED {}: no authorized key proved control", peer.label());
+        let _ = write_u8(&mut w, STATUS_DENY);
+        let _ = w.flush();
         return Ok(());
     };
+    write_u8(&mut w, STATUS_OK)?;
+    w.flush()?;
 
     // Read the request while the handshake deadline is still in force.
     let mut r = Deadline {

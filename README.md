@@ -7,10 +7,13 @@ forwarded SSH agent. This removes the need for interactive `sudo` on remote
 servers you control.
 
 The gate is cryptographic: on every connection the server sends a random 32-byte
-nonce, the client signs `"sudokey-auth-v1" || nonce` with each ed25519 identity
-in its agent, and the server grants access only if one of those keys is in its
+nonce, the client offers the ed25519 public keys its agent holds, and the server
+names the one it accepts. The client then signs `"sudokey-auth-v1" || nonce`
+with that key alone, and access is granted only if the key is in the server's
 `authorized_keys` file **and** the signature verifies (`verify_strict`). The
-per-connection random nonce prevents replay.
+per-connection random nonce prevents replay, and offering before signing keeps
+the agent to a single signature request — no confirmation prompts for unrelated
+keys.
 
 - Single **static** `x86_64-unknown-linux-musl` binary — no libc/OpenSSL runtime
   dependency, runs unchanged on Debian 11 (glibc 2.31) and NixOS.
@@ -157,21 +160,36 @@ five seconds) rather than orphaning a root process.
 Unix socket, one connection per client. All integers big-endian; SSH-style
 strings are `u32` length + bytes.
 
-1. Server → client: 4-byte magic `SDKY`, 1 version byte, 32-byte nonce.
-2. Client → server: `u32` count, then `(key_blob, sig_blob)` pairs. The client
-   signs `CONTEXT || nonce` with every ed25519 identity in its agent.
-3. Server → client: 1 status byte (1 = ok, 0 = deny). On deny it closes.
-4. Client → server: mode byte (0 = exec, 1 = pty), `u32` argc + args; for pty
+1. Server → client: 4-byte magic `SDKY`, 1 version byte (`2`), 32-byte nonce.
+2. Client → server: `u32` count, then that many ed25519 public key blobs — an
+   *offer*, carrying no signatures.
+3. Server → client: `u32` index of the first offered key it accepts, or
+   `0xFFFFFFFF` when none is authorized, in which case the client stops.
+4. Client → server: one signature blob over `CONTEXT || nonce`, made with the
+   key the server just selected.
+5. Server → client: 1 status byte (1 = ok, 0 = deny). On deny it closes.
+6. Client → server: mode byte (0 = exec, 1 = pty), `u32` argc + args; for pty
    also `u16` cols, `u16` rows, and a TERM string.
-5. Multiplexed frames `[u8 channel][u32 len][payload]`:
+7. Multiplexed frames `[u8 channel][u32 len][payload]`:
    `0` stdin (c→s), `1` stdout (s→c), `2` stderr (s→c, exec),
    `3` i32 exit status (s→c), `4` winsize cols/rows (c→s, pty),
    `5` stdin-EOF (c→s). All lengths are bounded.
-6. The client exits with the child's exit code.
+8. The client exits with the child's exit code.
 
-Steps 1–4 run under a single deadline (`--auth-timeout`, default 10s) and tight
+Steps 1–6 run under a single deadline (`--auth-timeout`, default 10s) and tight
 per-field size bounds; argv is carried as raw bytes, so non-UTF-8 arguments
 reach the command unchanged.
+
+Offering before signing is the point of steps 2–4, and mirrors OpenSSH's
+publickey auth. Signing with every identity up front, as protocol v1 did, costs
+one agent signature request *per key* — which against an agent that asks before
+it signs (1Password, `ssh-add -c`) is a confirmation prompt per key, for keys
+unrelated to sudokey, on every invocation. Listing and offering never prompt;
+only signing does. So the client now asks for exactly one signature, and for
+none at all when the server recognises none of its keys.
+
+Client and server must agree on the version byte. They are built and shipped
+together, and a mismatch is reported plainly rather than misparsed.
 
 The SSH agent is spoken directly over `$SSH_AUTH_SOCK`
 (`REQUEST_IDENTITIES` / `SIGN_REQUEST`).
@@ -227,3 +245,12 @@ The SSH agent is spoken directly over `$SSH_AUTH_SOCK`
   ever sent on it), and raw mode is entered before stdin is read.
 - The release profile no longer sets `panic = "abort"`: a panic in one
   connection handler used to take the whole broker down.
+
+## Changes in 0.2.1
+
+- **Fixed: every invocation asked the ssh-agent to sign with all of its keys.**
+  With several identities loaded and an agent that confirms before signing
+  (1Password, `ssh-add -c`), that meant a prompt per unrelated key before
+  reaching the authorized one. The handshake now offers public keys first and
+  signs only the one the server selects — one signature when authorized, none
+  at all when not. Protocol version 2; client and server must match.

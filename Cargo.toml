@@ -1,6 +1,6 @@
 [package]
 name = "sudokey"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Minimal SSH-agent-authenticated root command broker over a unix socket"
 license = "MIT"
