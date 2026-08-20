@@ -30,8 +30,10 @@
     rust-overlay,
     kache,
     ...
-  }:
-    flake-utils.lib.eachSystem ["x86_64-linux"] (system: let
+  }: let
+    systems = ["x86_64-linux"];
+
+    perSystem = flake-utils.lib.eachSystem systems (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [rust-overlay.overlays.default kache.overlays.default];
@@ -42,11 +44,6 @@
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         extensions = ["clippy" "rust-src" "rustfmt"];
         targets = ["x86_64-unknown-linux-musl"];
-      };
-
-      rustPlatform = pkgs.makeRustPlatform {
-        cargo = rustToolchain;
-        rustc = rustToolchain;
       };
     in {
       # `withKache` adds the kache package, sets RUSTC_WRAPPER to it, and emits
@@ -76,15 +73,67 @@
       devShell = self.devShells.${system}.default;
 
       packages = {
-        sudokey = rustPlatform.buildRustPackage {
-          pname = "sudokey";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          target = "x86_64-unknown-linux-musl";
-          doCheck = false;
-        };
+        sudokey = pkgs.callPackage ./nix/package.nix {};
+        # Dynamically linked against this system's glibc. Builds faster and is
+        # what you want when the binary never leaves the machine that built it.
+        sudokey-dynamic = pkgs.callPackage ./nix/package.nix {static = false;};
         default = self.packages.${system}.sudokey;
       };
+
+      apps.default = flake-utils.lib.mkApp {
+        drv = self.packages.${system}.sudokey;
+        name = "sudokey";
+      };
+
+      checks = {
+        static = self.packages.${system}.sudokey;
+        dynamic = self.packages.${system}.sudokey-dynamic;
+
+        # Derived from the package so it reuses the vendored dependency tree
+        # rather than trying to reach the network from a sandboxed build.
+        clippy = self.packages.${system}.sudokey-dynamic.overrideAttrs (old: {
+          pname = "sudokey-clippy";
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.clippy];
+          buildPhase = "cargo clippy --release --all-targets -- -D warnings";
+          installPhase = "touch $out";
+          doCheck = false;
+        });
+
+        fmt =
+          pkgs.runCommand "sudokey-fmt" {
+            nativeBuildInputs = [pkgs.rustfmt];
+          } ''
+            rustfmt --check --edition 2021 ${self}/src/*.rs
+            touch "$out"
+          '';
+
+        # Boots a real NixOS machine running the module and drives it as an
+        # unprivileged user. Needs KVM, so it is the slow one.
+        nixos = pkgs.callPackage ./nix/vm-test.nix {
+          module = self.nixosModules.sudokey;
+          package = self.packages.${system}.sudokey;
+        };
+      };
+
+      formatter = pkgs.alejandra;
     });
+  in
+    perSystem
+    // {
+      overlays.default = final: prev: {
+        sudokey = final.callPackage ./nix/package.nix {};
+      };
+
+      # Usable without the overlay: it pins `services.sudokey.package` to this
+      # flake's build for the host system.
+      nixosModules.sudokey = {
+        pkgs,
+        lib,
+        ...
+      }: {
+        imports = [./nix/module.nix];
+        services.sudokey.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.sudokey;
+      };
+      nixosModules.default = self.nixosModules.sudokey;
+    };
 }

@@ -1,0 +1,67 @@
+# sudokey unit for non-NixOS systems.
+#
+#   install -m 755 sudokey /usr/local/bin/sudokey
+#   install -m 644 sudokey.service /etc/systemd/system/sudokey.service
+#   systemctl daemon-reload && systemctl enable --now sudokey
+#
+# NixOS users should use the flake's nixosModules.default instead.
+
+[Unit]
+Description=sudokey ssh-agent-authenticated root command broker
+Documentation=https://github.com/sirati/sudokey
+After=network.target
+
+[Service]
+# `exec`, not `simple`: systemd then reports a failure to even start the binary
+# instead of calling the unit active regardless.
+Type=exec
+ExecStart=/usr/local/bin/sudokey serve \
+    --authorized /root/.config/sudokey/authorized_keys \
+    --socket /run/sudokey.sock \
+    --socket-mode 0660 \
+    --socket-group sudokey \
+    --max-connections 128 \
+    --max-per-uid 32 \
+    --auth-timeout 10
+
+# `systemctl reload sudokey` re-reads authorized_keys. Adding or revoking a key
+# needs no restart, so live sessions are never disturbed by a key change.
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2s
+SyslogIdentifier=sudokey
+
+# Only the broker is killed on stop/restart. Commands started through it are
+# long-lived root sessions and must outlive a restart of the broker, exactly as
+# ssh sessions outlive restarting sshd.
+KillMode=process
+
+# The daemon spends its life in accept(); this is well above the connection cap.
+LimitNOFILE=65536
+
+# ---------------------------------------------------------------------------
+# A NOTE ON SANDBOXING
+#
+# There are deliberately no ProtectSystem, PrivateTmp, NoNewPrivileges,
+# ProtectKernel*, RestrictSUIDSGID or MemoryDenyWriteExecute directives here.
+#
+# Every one of them is inherited by the commands this service starts, and those
+# commands are meant to be unrestricted root: ProtectSystem=strict breaks any
+# package or config management, NoNewPrivileges breaks every setuid helper,
+# ProtectKernelTunables breaks sysctl, MemoryDenyWriteExecute breaks every JIT.
+# A sandbox you have to switch off to get the job done is worse than none,
+# because it reads as protection that is not actually there.
+#
+# The hardening that does apply lives inside the daemon: a per-connection
+# ed25519 challenge, connection caps and handshake deadlines, a reset
+# environment for every child, StrictModes on the key file, and an audit record
+# naming the key behind each command.
+#
+# Note also that commands run through sudokey live in this unit's cgroup, so
+# any resource limit set here (MemoryMax, CPUQuota, TasksMax) applies to them
+# too. That is why none are set.
+# ---------------------------------------------------------------------------
+
+[Install]
+WantedBy=multi-user.target

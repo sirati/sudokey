@@ -45,18 +45,3 @@ pub fn get_winsize<Fd: AsFd>(fd: Fd) -> (u16, u16) {
 pub fn is_tty<Fd: AsFd>(fd: Fd) -> bool {
     termios::isatty(fd)
 }
-
-/// Selection of the shell to spawn when a pty request has no explicit argv.
-pub fn default_shell() -> String {
-    if let Ok(sh) = std::env::var("SHELL") {
-        if !sh.is_empty() {
-            return sh;
-        }
-    }
-    for cand in ["/bin/bash", "/bin/sh"] {
-        if std::path::Path::new(cand).exists() {
-            return cand.to_string();
-        }
-    }
-    "/bin/sh".to_string()
-}

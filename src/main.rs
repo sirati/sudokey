@@ -4,17 +4,31 @@
 //! control of an authorized ed25519 key (via the forwarded ssh-agent) and then
 //! run commands / interactive shells as root, without interactive sudo.
 
+#[macro_use]
+mod log;
+
 mod agent;
 mod client;
+mod keys;
+mod passwd;
 mod proto;
 mod pty;
 mod server;
 mod wire;
 
+use std::ffi::{OsStr, OsString};
 use std::process::exit;
+use std::time::Duration;
 
 const DEFAULT_SOCKET: &str = "/run/sudokey.sock";
 const DEFAULT_AUTHORIZED: &str = "/root/.config/sudokey/authorized_keys";
+/// `PATH` handed to commands run as root. Never inherited from the daemon's
+/// environment; `/run/current-system/sw/bin` is first so this works on NixOS.
+const DEFAULT_CHILD_PATH: &str =
+    "/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const DEFAULT_MAX_CONNS: usize = 128;
+const DEFAULT_MAX_CONNS_PER_UID: usize = 32;
+const DEFAULT_AUTH_TIMEOUT_SECS: u64 = 10;
 
 fn usage() -> &'static str {
     "\
@@ -42,10 +56,23 @@ USAGE:
     sudokey serve [OPTIONS]
 
 OPTIONS:
-    --authorized PATH   authorized_keys file (default /root/.config/sudokey/authorized_keys)
-    --socket PATH       unix socket path (default /run/sudokey.sock)
-    --socket-mode MODE  octal permissions for the socket (default 0666)
-    -h, --help          show this help
+    --authorized PATH     authorized_keys file
+                          (default /root/.config/sudokey/authorized_keys)
+    --socket PATH         unix socket path (default /run/sudokey.sock,
+                          or $SUDOKEY_SOCKET)
+    --socket-mode MODE    octal permissions for the socket (default 0666)
+    --socket-group GROUP  group to own the socket; pair with --socket-mode 0660
+                          to let only that group even open a connection
+    --max-connections N   concurrent connections to accept (default 128)
+    --max-per-uid N       concurrent connections per peer uid (default 32)
+    --auth-timeout SECS   deadline for a client to finish the handshake
+                          (default 10)
+    --path PATH           PATH given to commands run as root
+    -h, --help            show this help
+
+SIGNALS:
+    SIGHUP                re-read the authorized_keys file
+    SIGINT, SIGTERM       remove the socket and exit
 "
 }
 
@@ -57,7 +84,8 @@ USAGE:
     sudokey run [--socket PATH] -- <cmd> [args...]
 
 Streams stdout/stderr separately and exits with the command's exit code.
-Local stdin is forwarded to the command.
+Local stdin is forwarded to the command. Disconnecting terminates the
+remote command rather than orphaning it.
 "
 }
 
@@ -69,18 +97,27 @@ USAGE:
     sudokey shell [--socket PATH] [-- <cmd> [args...]]
 
 With no command, starts root's login shell. If stdin is a tty the local
-terminal is put in raw mode and restored on exit.
+terminal is put in raw mode and restored on exit, and window resizes are
+forwarded to the remote pty.
 "
 }
 
+/// Socket path to use when none is given on the command line.
+fn default_socket() -> OsString {
+    std::env::var_os("SUDOKEY_SOCKET").unwrap_or_else(|| DEFAULT_SOCKET.into())
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os`, not `args`: the latter panics outright on an argument that is
+    // not valid UTF-8, and the whole point of `sudokey run -- ...` is to pass
+    // arbitrary arguments (filenames, in particular) through untouched.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
         eprint!("{}", usage());
         exit(2);
     }
 
-    let sub = args[0].as_str();
+    let sub = args[0].to_str().unwrap_or("");
     let rest = &args[1..];
 
     let result = match sub {
@@ -108,66 +145,115 @@ fn main() {
     }
 }
 
-/// Pull an option that takes a value, e.g. `--socket PATH`.
-fn take_value(args: &[String], i: &mut usize, name: &str) -> Result<String, String> {
+/// Pull an option value that may be an arbitrary byte string, e.g. a path.
+fn arg_os(args: &[OsString], i: &mut usize, name: &str) -> std::io::Result<OsString> {
     *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| format!("option {name} requires a value"))
+    args.get(*i).cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("option {name} requires a value"),
+        )
+    })
 }
 
-fn cmd_serve(args: &[String]) -> std::io::Result<i32> {
-    let mut authorized = DEFAULT_AUTHORIZED.to_string();
-    let mut socket = DEFAULT_SOCKET.to_string();
-    let mut socket_mode: u32 = 0o666;
+/// Pull an option value that must be text.
+fn arg_val(args: &[OsString], i: &mut usize, name: &str) -> std::io::Result<String> {
+    let v = arg_os(args, i, name)?;
+    v.into_string().map_err(|v| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("option {name} needs text, got '{}'", v.to_string_lossy()),
+        )
+    })
+}
+
+fn arg_num<T: std::str::FromStr>(
+    args: &[OsString],
+    i: &mut usize,
+    name: &str,
+) -> std::io::Result<T> {
+    let v = arg_val(args, i, name)?;
+    v.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("option {name} needs a number, got '{v}'"),
+        )
+    })
+}
+
+fn cmd_serve(args: &[OsString]) -> std::io::Result<i32> {
+    let mut opts = server::ServeOpts {
+        authorized_path: DEFAULT_AUTHORIZED.to_string(),
+        socket_path: default_socket().to_string_lossy().into_owned(),
+        socket_mode: 0o666,
+        socket_group: None,
+        max_conns: DEFAULT_MAX_CONNS,
+        max_conns_per_uid: DEFAULT_MAX_CONNS_PER_UID,
+        auth_timeout: Duration::from_secs(DEFAULT_AUTH_TIMEOUT_SECS),
+        child_path: DEFAULT_CHILD_PATH.to_string(),
+    };
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--authorized" => authorized = arg_val(args, &mut i, "--authorized")?,
-            "--socket" => socket = arg_val(args, &mut i, "--socket")?,
+        match args[i].to_str().unwrap_or("") {
+            "--authorized" => opts.authorized_path = arg_val(args, &mut i, "--authorized")?,
+            "--socket" => opts.socket_path = arg_val(args, &mut i, "--socket")?,
             "--socket-mode" => {
                 let v = arg_val(args, &mut i, "--socket-mode")?;
-                socket_mode = u32::from_str_radix(v.trim_start_matches("0o"), 8).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid octal socket mode '{v}'"),
-                    )
-                })?;
+                opts.socket_mode = u32::from_str_radix(v.trim_start_matches("0o"), 8)
+                    .ok()
+                    .filter(|m| *m <= 0o777)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("invalid octal socket mode '{v}'"),
+                        )
+                    })?;
             }
+            "--socket-group" => opts.socket_group = Some(arg_val(args, &mut i, "--socket-group")?),
+            "--max-connections" => opts.max_conns = arg_num(args, &mut i, "--max-connections")?,
+            "--max-per-uid" => opts.max_conns_per_uid = arg_num(args, &mut i, "--max-per-uid")?,
+            "--auth-timeout" => {
+                let secs: u64 = arg_num(args, &mut i, "--auth-timeout")?;
+                opts.auth_timeout = Duration::from_secs(secs.max(1));
+            }
+            "--path" => opts.child_path = arg_val(args, &mut i, "--path")?,
             "-h" | "--help" => {
                 print!("{}", serve_help());
                 return Ok(0);
             }
-            other => {
+            _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("serve: unexpected argument '{other}'"),
+                    format!("serve: unexpected argument '{}'", args[i].to_string_lossy()),
                 ));
             }
         }
         i += 1;
     }
 
-    server::serve(server::ServeOpts {
-        authorized_path: authorized,
-        socket_path: socket,
-        socket_mode,
-    })?;
+    if opts.max_conns == 0 || opts.max_conns_per_uid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "connection limits must be at least 1",
+        ));
+    }
+
+    server::serve(opts)?;
     Ok(0)
 }
 
 /// Split off options before `--`, returning (socket_override, command_argv).
 fn parse_client_args(
-    args: &[String],
+    args: &[OsString],
     help: &'static str,
-) -> Result<Option<(String, Vec<String>)>, std::io::Error> {
-    let mut socket = DEFAULT_SOCKET.to_string();
+) -> Result<Option<(OsString, Vec<OsString>)>, std::io::Error> {
+    let mut socket = default_socket();
     let mut i = 0;
     let mut argv = Vec::new();
     while i < args.len() {
-        match args[i].as_str() {
-            "--socket" => socket = arg_val(args, &mut i, "--socket")?,
+        match args[i].to_str().unwrap_or("") {
+            "--socket" => socket = arg_os(args, &mut i, "--socket")?,
             "-h" | "--help" => {
                 print!("{help}");
                 return Ok(None);
@@ -176,10 +262,13 @@ fn parse_client_args(
                 argv = args[i + 1..].to_vec();
                 break;
             }
-            other => {
+            _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("unexpected argument '{other}' (put the command after `--`)"),
+                    format!(
+                        "unexpected argument '{}' (put the command after `--`)",
+                        args[i].to_string_lossy()
+                    ),
                 ));
             }
         }
@@ -188,32 +277,28 @@ fn parse_client_args(
     Ok(Some((socket, argv)))
 }
 
-fn cmd_run(args: &[String]) -> std::io::Result<i32> {
+fn cmd_run(args: &[OsString]) -> std::io::Result<i32> {
     match parse_client_args(args, run_help())? {
         None => Ok(0),
         Some((socket, argv)) => client::run(&socket, argv),
     }
 }
 
-fn cmd_shell(args: &[String]) -> std::io::Result<i32> {
+fn cmd_shell(args: &[OsString]) -> std::io::Result<i32> {
     match parse_client_args(args, shell_help())? {
         None => Ok(0),
         Some((socket, argv)) => client::shell(&socket, argv),
     }
 }
 
-fn cmd_list_keys(args: &[String]) -> std::io::Result<i32> {
+fn cmd_list_keys(args: &[OsString]) -> std::io::Result<i32> {
     for a in args {
-        if a == "-h" || a == "--help" {
-            println!("sudokey list-keys - print the agent's ed25519 keys in authorized_keys format");
+        if a == OsStr::new("-h") || a == OsStr::new("--help") {
+            println!(
+                "sudokey list-keys - print the agent's ed25519 keys in authorized_keys format"
+            );
             return Ok(0);
         }
     }
     client::list_keys()
-}
-
-/// Helper wrapping `take_value` into an `io::Result`.
-fn arg_val(args: &[String], i: &mut usize, name: &str) -> std::io::Result<String> {
-    take_value(args, i, name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }

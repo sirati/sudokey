@@ -39,18 +39,25 @@ pub fn write_i32(w: &mut impl Write, v: i32) -> io::Result<()> {
     w.write_all(&v.to_be_bytes())
 }
 
-/// Read a `u32`-length-prefixed byte string (SSH wire "string").
-pub fn read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
+/// Read a `u32`-length-prefixed byte string (SSH wire "string"), rejecting
+/// anything longer than `max`. Callers on the pre-authentication path pass a
+/// tight bound so an unauthenticated peer cannot steer our allocations.
+pub fn read_string_bounded(r: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let len = read_u32(r)? as usize;
-    if len > MAX_STRING {
+    if len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("string too long: {len} bytes"),
+            format!("string too long: {len} bytes (max {max})"),
         ));
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Read a `u32`-length-prefixed byte string with the default `MAX_STRING` cap.
+pub fn read_string(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    read_string_bounded(r, MAX_STRING)
 }
 
 /// Write a `u32`-length-prefixed byte string.

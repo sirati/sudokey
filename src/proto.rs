@@ -34,3 +34,11 @@ pub const MAX_FRAME: usize = 1 << 20; // 1 MiB per stream frame
 pub const MAX_STRING: usize = 1 << 18; // 256 KiB per ssh-wire string
 pub const MAX_KEYS: u32 = 64; // auth pairs per connection
 pub const MAX_ARGV: u32 = 4096; // argv elements
+
+/// Handshake-specific bounds. `MAX_STRING` is far too generous for the
+/// handshake: without these a single connection could make the server allocate
+/// `MAX_KEYS * MAX_STRING` (16 MiB) of key material, or `MAX_ARGV * MAX_STRING`
+/// (1 GiB) of argv, before any authentication has happened.
+pub const MAX_BLOB: usize = 8 << 10; // 8 KiB per key/signature blob
+pub const MAX_ARGV_BYTES: usize = 1 << 20; // 1 MiB of argv in total
+pub const MAX_TERM: usize = 64; // TERM is a short token

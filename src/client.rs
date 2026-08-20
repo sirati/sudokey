@@ -1,7 +1,10 @@
 //! Client subcommands: `run` (exec), `shell` (pty), and `list-keys`.
 
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::agent;
@@ -11,22 +14,51 @@ use crate::wire::*;
 
 /// Connect to the broker socket and complete the ssh-agent challenge/response.
 /// Returns the authenticated stream, or an error if access is denied.
-fn connect_and_auth(socket_path: &str) -> io::Result<UnixStream> {
+fn connect_and_auth(socket_path: &OsStr) -> io::Result<UnixStream> {
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        io::Error::new(e.kind(), format!("cannot connect to {socket_path}: {e}"))
+        let hint = match e.kind() {
+            io::ErrorKind::NotFound => "  (is `sudokey serve` running?)",
+            io::ErrorKind::ConnectionRefused => {
+                "  (the socket is stale — the daemon is not listening on it)"
+            }
+            io::ErrorKind::PermissionDenied => {
+                "  (you are not permitted to open the socket; check its mode and group)"
+            }
+            _ => "",
+        };
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot connect to {}: {e}{hint}",
+                std::path::Path::new(socket_path).display()
+            ),
+        )
     })?;
 
     // 1. Receive magic + version + nonce.
     let mut magic = [0u8; 4];
-    stream.read_exact(&mut magic)?;
+    stream.read_exact(&mut magic).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the server closed the connection before greeting us \
+                 (it is most likely at its connection limit — see its log)",
+            )
+        } else {
+            e
+        }
+    })?;
     if magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad server magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad server magic",
+        ));
     }
     let version = read_u8(&mut stream)?;
     if version != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported server protocol version {version}"),
+            format!("unsupported server protocol version {version} (this client speaks {VERSION})"),
         ));
     }
     let mut nonce = [0u8; NONCE_LEN];
@@ -37,17 +69,27 @@ fn connect_and_auth(socket_path: &str) -> io::Result<UnixStream> {
     signed.extend_from_slice(CONTEXT);
     signed.extend_from_slice(&nonce);
 
-    // 2. Sign with every ed25519 identity the agent holds.
-    let mut agent_conn = agent::connect().map_err(|e| {
-        io::Error::new(e.kind(), format!("ssh-agent: {e}"))
-    })?;
+    // 2. Sign with every ed25519 identity the agent holds, up to what the
+    //    server will accept — sending more just gets the connection dropped.
+    let mut agent_conn =
+        agent::connect().map_err(|e| io::Error::new(e.kind(), format!("ssh-agent: {e}")))?;
     let ids = agent::list_identities(&mut agent_conn)?;
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for id in ids.iter().filter(|i| i.is_ed25519()) {
+        if pairs.len() >= MAX_KEYS as usize {
+            break;
+        }
         // Agent refused to sign with this key -> skip it.
         if let Ok(Some(sig)) = agent::sign(&mut agent_conn, &id.key_blob, &signed) {
             pairs.push((id.key_blob.clone(), sig));
         }
+    }
+    if pairs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the ssh-agent produced no ed25519 signatures \
+             (is an agent forwarded, and does it hold an ed25519 key?)",
+        ));
     }
 
     write_u32(&mut stream, pairs.len() as u32)?;
@@ -68,7 +110,10 @@ fn connect_and_auth(socket_path: &str) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
-fn write_argv(w: &mut impl Write, argv: &[String]) -> io::Result<()> {
+/// argv goes over the wire as raw bytes. Arguments are frequently filenames,
+/// and a filename is a byte string, not text — round-tripping it through UTF-8
+/// would quietly hand the server a different command than the one asked for.
+fn write_argv(w: &mut impl Write, argv: &[std::ffi::OsString]) -> io::Result<()> {
     write_u32(w, argv.len() as u32)?;
     for a in argv {
         write_string(w, a.as_bytes())?;
@@ -77,7 +122,7 @@ fn write_argv(w: &mut impl Write, argv: &[String]) -> io::Result<()> {
 }
 
 /// `sudokey run -- <cmd>` : non-interactive exec mode.
-pub fn run(socket_path: &str, argv: Vec<String>) -> io::Result<i32> {
+pub fn run(socket_path: &OsStr, argv: Vec<std::ffi::OsString>) -> io::Result<i32> {
     if argv.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -92,7 +137,7 @@ pub fn run(socket_path: &str, argv: Vec<String>) -> io::Result<i32> {
 
     // Forward local stdin -> CH_STDIN, EOF -> CH_STDIN_EOF.
     let mut write_half = stream.try_clone()?;
-    thread::spawn(move || {
+    thread::Builder::new().name("stdin".into()).spawn(move || {
         let mut inp = io::stdin();
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -109,14 +154,13 @@ pub fn run(socket_path: &str, argv: Vec<String>) -> io::Result<i32> {
                 Err(_) => break,
             }
         }
-    });
+    })?;
 
-    let code = read_output_loop(&mut stream, true)?;
-    Ok(code)
+    read_output_loop(&mut stream, true)
 }
 
 /// `sudokey shell [-- <cmd>]` : interactive pty mode.
-pub fn shell(socket_path: &str, argv: Vec<String>) -> io::Result<i32> {
+pub fn shell(socket_path: &OsStr, argv: Vec<std::ffi::OsString>) -> io::Result<i32> {
     let mut stream = connect_and_auth(socket_path)?;
 
     let stdin = io::stdin();
@@ -135,36 +179,69 @@ pub fn shell(socket_path: &str, argv: Vec<String>) -> io::Result<i32> {
     write_string(&mut stream, term.as_bytes())?;
     stream.flush()?;
 
-    // Forward local stdin -> CH_STDIN.
-    let mut write_half = stream.try_clone()?;
-    thread::spawn(move || {
-        let mut inp = io::stdin();
-        let mut buf = [0u8; 32 * 1024];
-        loop {
-            match inp.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if write_frame(&mut write_half, CH_STDIN, &buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Raw mode is scoped so the guard restores the terminal before we return
-    // (std::process::exit at the top level would skip destructors).
+    // Raw mode goes on before anything reads stdin, otherwise the terminal's
+    // line discipline swallows whatever the user types in the meantime. The
+    // guard is scoped so the terminal is restored before we return (the
+    // top-level `process::exit` would skip destructors).
     let code = {
         let _raw = pty::RawGuard::new(io::stdin())?;
+
+        // The write half is shared between the stdin pump and the SIGWINCH
+        // thread, so their frames cannot interleave mid-frame.
+        let write_half = Arc::new(Mutex::new(stream.try_clone()?));
+
+        if is_tty {
+            spawn_winch_forwarder(Arc::clone(&write_half))?;
+        }
+
+        let stdin_half = Arc::clone(&write_half);
+        thread::Builder::new().name("stdin".into()).spawn(move || {
+            let mut inp = io::stdin();
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                match inp.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut g = stdin_half.lock().unwrap_or_else(|e| e.into_inner());
+                        if write_frame(&mut *g, CH_STDIN, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })?;
+
         read_output_loop(&mut stream, false)?
     };
     Ok(code)
 }
 
+/// Relay terminal resizes to the remote pty. Without this the protocol's
+/// `CH_WINCH` channel existed but nothing ever sent on it, so resizing the
+/// window left the remote `top`/`vim` drawing at the original size.
+fn spawn_winch_forwarder(write_half: Arc<Mutex<UnixStream>>) -> io::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
+    thread::Builder::new().name("winch".into()).spawn(move || {
+        for _ in signals.forever() {
+            let (cols, rows) = pty::get_winsize(io::stdin());
+            let mut payload = [0u8; 4];
+            payload[..2].copy_from_slice(&cols.to_be_bytes());
+            payload[2..].copy_from_slice(&rows.to_be_bytes());
+            let mut g = write_half.lock().unwrap_or_else(|e| e.into_inner());
+            if write_frame(&mut *g, CH_WINCH, &payload).is_err() {
+                break;
+            }
+        }
+    })?;
+    Ok(())
+}
+
 /// Read server->client frames until the exit frame; write stdout (and stderr
 /// if `split_stderr`). Returns the propagated exit code.
 fn read_output_loop(stream: &mut UnixStream, split_stderr: bool) -> io::Result<i32> {
+    // Not 0: if the connection dies before an exit frame arrives we must not
+    // claim the remote command succeeded.
     let mut code = 1;
     loop {
         match read_frame(stream) {
