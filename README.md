@@ -53,7 +53,7 @@ That installs the binary, writes `/etc/sudokey/authorized_keys`, and starts a
 Changing `authorizedKeys` and rebuilding takes effect immediately — the daemon
 re-reads the file, so adding or revoking a key never disturbs live sessions.
 
-Options: `package`, `authorizedKeys`, `authorizedKeysFile`, `socketPath`,
+Options: `package`, `authorizedKeys`, `authorizedKeysFile`, `autoStart`, `socketPath`,
 `socketMode`, `socketGroup`, `maxConnections`, `maxConnectionsPerUid`,
 `authTimeout`, `commandPath`, `extraArgs`. See `nix/module.nix`.
 

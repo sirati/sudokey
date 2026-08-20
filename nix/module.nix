@@ -81,6 +81,22 @@ in {
       '';
     };
 
+    autoStart = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Start the broker at boot.
+
+        With this set to `false` the unit is installed but not activated, so
+        the daemon runs only once someone starts it deliberately
+        (`systemctl start sudokey`). systemd's default policy already limits
+        that to root and to administrators authenticating through polkit
+        (`org.freedesktop.systemd1.manage-units`, `auth_admin_keep`, with
+        `wheel` as the admin group), so this gives you root-on-demand without
+        a root broker listening around the clock.
+      '';
+    };
+
     socketPath = lib.mkOption {
       type = lib.types.str;
       default = "/run/sudokey.sock";
@@ -160,7 +176,9 @@ in {
     systemd.services.sudokey = {
       description = "sudokey ssh-agent-authenticated root command broker";
       documentation = ["https://github.com/sirati/sudokey"];
-      wantedBy = ["multi-user.target"];
+      # Empty when autoStart is off: the unit still exists and can be started
+      # by hand, it just is not pulled in at boot.
+      wantedBy = lib.optionals cfg.autoStart ["multi-user.target"];
       after = ["network.target"];
 
 
