@@ -114,6 +114,50 @@
         threading.Thread(target=serve, args=(c,), daemon=True).start()
   '';
 
+  # Backgrounds a `sudokey run` from a shell that has job control and a
+  # controlling terminal, then reports how it ended. Reading the terminal from
+  # a background process group raises SIGTTIN, whose default action stops the
+  # process -- so a client that forwards stdin unconditionally never finishes
+  # here, and `< /dev/null` was the only workaround.
+  bgUnderTty = pkgs.writeShellScript "sudokey-bg-under-tty" ''
+    sudokey run -- id -u > "$OUT" 2>&1 &
+    p=$!
+    sleep 3
+    st=$(ps -o stat= -p $p 2>/dev/null | tr -d ' ' || true)
+    wait $p; rc=$?
+    echo "state=''${st:-gone} rc=$rc out=$(cat "$OUT")"
+  '';
+
+  # Prints one "state=... rc=... out=..." line for the backgrounded run.
+  stdinBehaviour = pkgs.writeShellScript "sudokey-stdin-behaviour" ''
+    set -eu
+    export PATH="${pkgs.openssh}/bin:${pkgs.util-linux}/bin:$PATH"
+    d=$(mktemp -d)
+    install -m 600 ${testKeyPriv} "$d/key"
+    eval "$(ssh-agent -s)" >/dev/null
+    trap 'kill $SSH_AGENT_PID 2>/dev/null || true' EXIT
+    ssh-add "$d/key" 2>/dev/null
+    export OUT="$d/out"
+    script -qec "bash -m ${bgUnderTty}" /dev/null | tr -d '\r' | grep '^state='
+  '';
+
+  # A reader that goes away must end the command the way it ends any other
+  # pipeline member: quietly, with status 141. Prints "rc=<n> err=<text>".
+  pipeBehaviour = pkgs.writeShellScript "sudokey-pipe-behaviour" ''
+    set -eu
+    export PATH="${pkgs.openssh}/bin:$PATH"
+    d=$(mktemp -d)
+    install -m 600 ${testKeyPriv} "$d/key"
+    eval "$(ssh-agent -s)" >/dev/null
+    trap 'kill $SSH_AGENT_PID 2>/dev/null || true' EXIT
+    ssh-add "$d/key" 2>/dev/null
+    set +e
+    sudokey run -- yes 2>"$d/err" | head -1 >/dev/null
+    rc=''${PIPESTATUS[0]}
+    set -e
+    echo "rc=$rc err=$(tr -d '\n' < "$d/err")"
+  '';
+
   # Loads four keys, only the third of which is authorized, and reports how
   # many signatures one `sudokey run` cost. Prints "<list> <sign>".
   countSignRequests = pkgs.writeShellScript "sudokey-count-sign-requests" ''
@@ -236,6 +280,20 @@ in
       with subtest("a user outside the socket group cannot even connect"):
           err = machine.fail("su - mallory -c 'sudokey run -- id' 2>&1")
           assert "ermission denied" in err, f"unexpected failure mode: {err!r}"
+
+      with subtest("a backgrounded run is not stopped by SIGTTIN"):
+          # Without this the client read the controlling terminal from a
+          # background process group, was stopped (state T, rc 149), and never
+          # ran the command at all unless you remembered `< /dev/null`.
+          line = machine.succeed("su - alice -c ${stdinBehaviour}").strip()
+          assert "state=gone" in line, f"the job did not finish: {line}"
+          assert "rc=0" in line, f"non-zero exit: {line}"
+          assert "out=0" in line, f"command did not run as root: {line}"
+
+      with subtest("a closed output pipe ends the command quietly, status 141"):
+          line = machine.succeed("su - alice -c ${pipeBehaviour}").strip()
+          assert "rc=141" in line, f"expected status 141, got: {line}"
+          assert line.endswith("err="), f"expected no error output, got: {line}"
 
       with subtest("only the key the server selects is ever signed with"):
           # The bug this guards: v1 asked the agent to sign with every ed25519

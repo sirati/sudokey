@@ -155,6 +155,16 @@ the protocol carries no working directory.
 Disconnecting terminates the remote command (`SIGTERM`, then `SIGKILL` after
 five seconds) rather than orphaning a root process.
 
+`run` forwards local stdin, but only when there is something to forward from.
+Reading a terminal that the process is not in the foreground of would raise
+`SIGTTIN` and suspend it, so in that case stdin is reported closed instead —
+which is what lets `sudokey run -- ... &` work without `< /dev/null`. Pass
+`-n`/`--no-stdin` to close stdin explicitly, as `ssh -n` does.
+
+Output behaves like any other pipeline member: if the reader goes away
+(`sudokey run -- yes | head -1`), the command is terminated and the client
+exits 141 quietly rather than reporting a broken pipe.
+
 ## Protocol (summary)
 
 Unix socket, one connection per client. All integers big-endian; SSH-style
@@ -254,3 +264,15 @@ The SSH agent is spoken directly over `$SSH_AUTH_SOCK`
   reaching the authorized one. The handshake now offers public keys first and
   signs only the one the server selects — one signature when authorized, none
   at all when not. Protocol version 2; client and server must match.
+
+## Changes in 0.2.2
+
+- **Fixed: `sudokey run` was suspended by `SIGTTIN` when backgrounded.** The
+  client forwarded local stdin unconditionally, and reading the controlling
+  terminal from a background process group stops the process — so
+  `sudokey run -- ... &` hung at status 149 without ever running the command,
+  unless you added `< /dev/null`. stdin is now forwarded only when it can be
+  read, and reported closed otherwise. `-n`/`--no-stdin` closes it explicitly.
+- **Fixed: a closed output pipe printed `Broken pipe (os error 32)`.**
+  `sudokey run -- yes | head -1` now ends the remote command and exits 141
+  silently, like every other member of a pipeline.

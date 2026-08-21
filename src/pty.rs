@@ -45,3 +45,25 @@ pub fn get_winsize<Fd: AsFd>(fd: Fd) -> (u16, u16) {
 pub fn is_tty<Fd: AsFd>(fd: Fd) -> bool {
     termios::isatty(fd)
 }
+
+/// True if reading `fd` would block on the terminal rather than raise SIGTTIN.
+///
+/// Reading the controlling terminal from a *background* process group raises
+/// SIGTTIN, whose default action stops the process. A client that forwards
+/// stdin unconditionally therefore wedges the moment it is backgrounded --
+/// `sudokey run -- id &` stops before the command finishes, and the only way
+/// out is `< /dev/null`. Comparing the terminal's foreground process group
+/// with our own says up front whether reading is safe.
+///
+/// Anything that is not a terminal (a pipe, a file, /dev/null) is always
+/// readable in this sense.
+pub fn is_foreground<Fd: AsFd>(fd: Fd) -> bool {
+    if !termios::isatty(&fd) {
+        return true;
+    }
+    match termios::tcgetpgrp(&fd) {
+        Ok(fg) => fg == rustix::process::getpgrp(),
+        // No controlling terminal for this fd: nothing will send us SIGTTIN.
+        Err(_) => true,
+    }
+}

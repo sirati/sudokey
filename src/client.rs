@@ -149,7 +149,11 @@ fn write_argv(w: &mut impl Write, argv: &[std::ffi::OsString]) -> io::Result<()>
 }
 
 /// `sudokey run -- <cmd>` : non-interactive exec mode.
-pub fn run(socket_path: &OsStr, argv: Vec<std::ffi::OsString>) -> io::Result<i32> {
+pub fn run(
+    socket_path: &OsStr,
+    argv: Vec<std::ffi::OsString>,
+    forward_stdin: bool,
+) -> io::Result<i32> {
     if argv.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -162,26 +166,40 @@ pub fn run(socket_path: &OsStr, argv: Vec<std::ffi::OsString>) -> io::Result<i32
     write_argv(&mut stream, &argv)?;
     stream.flush()?;
 
-    // Forward local stdin -> CH_STDIN, EOF -> CH_STDIN_EOF.
+    // Forward local stdin unless we were told not to, or unless reading it
+    // would stop us. Reading the controlling terminal from a background
+    // process group raises SIGTTIN, which suspends the process before the
+    // command ever finishes -- `sudokey run -- id &` used to hang there, and
+    // `< /dev/null` was the only way past it. There is nothing to forward from
+    // a terminal nobody is typing at, so close the channel instead.
+    let stdin_usable = forward_stdin && pty::is_foreground(io::stdin());
     let mut write_half = stream.try_clone()?;
-    thread::Builder::new().name("stdin".into()).spawn(move || {
-        let mut inp = io::stdin();
-        let mut buf = [0u8; 32 * 1024];
-        loop {
-            match inp.read(&mut buf) {
-                Ok(0) => {
-                    let _ = write_frame(&mut write_half, CH_STDIN_EOF, &[]);
-                    break;
-                }
-                Ok(n) => {
-                    if write_frame(&mut write_half, CH_STDIN, &buf[..n]).is_err() {
+    if stdin_usable {
+        thread::Builder::new().name("stdin".into()).spawn(move || {
+            let mut inp = io::stdin();
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                match inp.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = write_frame(&mut write_half, CH_STDIN_EOF, &[]);
                         break;
                     }
+                    Ok(n) => {
+                        if write_frame(&mut write_half, CH_STDIN, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    // Includes EIO, which is what a background read of the tty
+                    // gives once SIGTTIN is ignored rather than fatal.
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-    })?;
+        })?;
+    } else {
+        // Tell the command its stdin is closed, rather than leaving it to
+        // block on input that will never arrive.
+        let _ = write_frame(&mut write_half, CH_STDIN_EOF, &[]);
+    }
 
     read_output_loop(&mut stream, true)
 }
@@ -264,6 +282,21 @@ fn spawn_winch_forwarder(write_half: Arc<Mutex<UnixStream>>) -> io::Result<()> {
     Ok(())
 }
 
+/// Exit status a process killed by SIGPIPE reports, which is what every other
+/// member of a pipeline uses when its reader goes away.
+const EXIT_SIGPIPE: i32 = 128 + 13;
+
+/// Write local output, reporting a vanished reader separately from a real
+/// failure. `sudokey run -- yes | head -1` must behave like any other filter:
+/// stop quietly, not print `sudokey: Broken pipe (os error 32)`.
+fn write_local(w: &mut impl Write, data: &[u8]) -> io::Result<bool> {
+    match w.write_all(data).and_then(|()| w.flush()) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Read server->client frames until the exit frame; write stdout (and stderr
 /// if `split_stderr`). Returns the propagated exit code.
 fn read_output_loop(stream: &mut UnixStream, split_stderr: bool) -> io::Result<i32> {
@@ -271,31 +304,29 @@ fn read_output_loop(stream: &mut UnixStream, split_stderr: bool) -> io::Result<i
     // claim the remote command succeeded.
     let mut code = 1;
     loop {
-        match read_frame(stream) {
-            Ok((CH_STDOUT, data)) => {
-                let mut out = io::stdout();
-                out.write_all(&data)?;
-                out.flush()?;
-            }
+        let delivered = match read_frame(stream) {
+            Ok((CH_STDOUT, data)) => write_local(&mut io::stdout(), &data)?,
             Ok((CH_STDERR, data)) => {
                 if split_stderr {
-                    let mut err = io::stderr();
-                    err.write_all(&data)?;
-                    err.flush()?;
+                    write_local(&mut io::stderr(), &data)?
                 } else {
                     // pty mode: everything is one stream
-                    let mut out = io::stdout();
-                    out.write_all(&data)?;
-                    out.flush()?;
+                    write_local(&mut io::stdout(), &data)?
                 }
             }
             Ok((CH_EXIT, data)) if data.len() >= 4 => {
                 code = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 break;
             }
-            Ok(_) => {}
+            Ok(_) => true,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
+        };
+        if !delivered {
+            // Nobody is reading our output any more. Dropping the connection
+            // also terminates the remote command, which is what a pipeline
+            // reader closing is supposed to mean.
+            return Ok(EXIT_SIGPIPE);
         }
     }
     Ok(code)

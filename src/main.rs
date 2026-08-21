@@ -81,11 +81,23 @@ fn run_help() -> &'static str {
 sudokey run - execute a command as root (non-interactive)
 
 USAGE:
-    sudokey run [--socket PATH] -- <cmd> [args...]
+    sudokey run [--socket PATH] [-n] -- <cmd> [args...]
+
+OPTIONS:
+    --socket PATH   unix socket path (default /run/sudokey.sock,
+                    or $SUDOKEY_SOCKET)
+    -n, --no-stdin  do not forward local stdin; the command sees it closed
+    -h, --help      show this help
 
 Streams stdout/stderr separately and exits with the command's exit code.
-Local stdin is forwarded to the command. Disconnecting terminates the
-remote command rather than orphaning it.
+Local stdin is forwarded to the command, except when there is nothing to
+forward from: reading a terminal that this process is not in the foreground
+of would raise SIGTTIN and suspend it, so stdin is reported closed instead.
+That is what makes `sudokey run -- ... &` work without `< /dev/null`.
+
+Disconnecting terminates the remote command rather than orphaning it, and a
+closed output pipe (`sudokey run -- yes | head`) ends the command quietly
+with status 141, as any other pipeline member would.
 "
 }
 
@@ -243,23 +255,35 @@ fn cmd_serve(args: &[OsString]) -> std::io::Result<i32> {
     Ok(0)
 }
 
-/// Split off options before `--`, returning (socket_override, command_argv).
+/// Options common to the client subcommands, plus the command to run.
+struct ClientArgs {
+    socket: OsString,
+    argv: Vec<OsString>,
+    /// False for `-n`: do not forward local stdin at all.
+    forward_stdin: bool,
+}
+
+/// Split off options before `--`. `Ok(None)` means help was printed.
 fn parse_client_args(
     args: &[OsString],
     help: &'static str,
-) -> Result<Option<(OsString, Vec<OsString>)>, std::io::Error> {
-    let mut socket = default_socket();
+) -> Result<Option<ClientArgs>, std::io::Error> {
+    let mut parsed = ClientArgs {
+        socket: default_socket(),
+        argv: Vec::new(),
+        forward_stdin: true,
+    };
     let mut i = 0;
-    let mut argv = Vec::new();
     while i < args.len() {
         match args[i].to_str().unwrap_or("") {
-            "--socket" => socket = arg_os(args, &mut i, "--socket")?,
+            "--socket" => parsed.socket = arg_os(args, &mut i, "--socket")?,
+            "-n" | "--no-stdin" => parsed.forward_stdin = false,
             "-h" | "--help" => {
                 print!("{help}");
                 return Ok(None);
             }
             "--" => {
-                argv = args[i + 1..].to_vec();
+                parsed.argv = args[i + 1..].to_vec();
                 break;
             }
             _ => {
@@ -274,20 +298,20 @@ fn parse_client_args(
         }
         i += 1;
     }
-    Ok(Some((socket, argv)))
+    Ok(Some(parsed))
 }
 
 fn cmd_run(args: &[OsString]) -> std::io::Result<i32> {
     match parse_client_args(args, run_help())? {
         None => Ok(0),
-        Some((socket, argv)) => client::run(&socket, argv),
+        Some(a) => client::run(&a.socket, a.argv, a.forward_stdin),
     }
 }
 
 fn cmd_shell(args: &[OsString]) -> std::io::Result<i32> {
     match parse_client_args(args, shell_help())? {
         None => Ok(0),
-        Some((socket, argv)) => client::shell(&socket, argv),
+        Some(a) => client::shell(&a.socket, a.argv),
     }
 }
 
